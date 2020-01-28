@@ -30,6 +30,11 @@ test_fail_cb(const char* reason, const char* file, int line) {
 
 #define test_fail(msg) test_fail_cb(msg, __FILE__, __LINE__)
 
+static void
+defer_free_thread(void *arg) {
+	rpfree(arg);
+}
+
 static int
 test_alloc(void) {
 	unsigned int iloop = 0;
@@ -111,6 +116,8 @@ test_alloc(void) {
 			return test_fail("Bad usable size (aligned realloc)");
 		if (*((uintptr_t*)testptr) != 0x12345678)
 			return test_fail("Data not preserved on realloc");
+		if (rpaligned_realloc(testptr, 128, size * 1024 * 4, 0, RPMALLOC_GROW_OR_FAIL))
+			return test_fail("Realloc with grow-or-fail did not fail as expected");
 		void* unaligned = rprealloc(testptr, size);
 		if (unaligned != testptr) {
 			ptrdiff_t diff = pointer_diff(testptr, unaligned);
@@ -122,11 +129,23 @@ test_alloc(void) {
 		rpfree(testptr);
 	}
 
-	static size_t alignment[3] = { 0, 64, 256 };
+	static size_t alignment[5] = { 0, 32, 64, 128, 256 };
+	for (iloop = 0; iloop < 5; ++iloop) {
+		for (ipass = 0; ipass < 128 * 1024; ++ipass) {
+			size_t this_alignment = alignment[iloop];
+			char* baseptr = rpaligned_alloc(this_alignment, ipass);
+			if (this_alignment && ((uintptr_t)baseptr & (this_alignment - 1)))
+				return test_fail("Alignment failed");
+			rpfree(baseptr);
+		}
+	}
 	for (iloop = 0; iloop < 64; ++iloop) {
 		for (ipass = 0; ipass < 8142; ++ipass) {
+			size_t this_alignment = alignment[ipass % 5];
 			size_t size = iloop + ipass + datasize[(iloop + ipass) % 7];
-			char* baseptr = rpaligned_alloc(alignment[ipass % 3], size);
+			char* baseptr = rpaligned_alloc(this_alignment, size);
+			if (this_alignment && ((uintptr_t)baseptr & (this_alignment - 1)))
+				return test_fail("Alignment failed");
 			for (size_t ibyte = 0; ibyte < size; ++ibyte)
 				baseptr[ibyte] = (char)(ibyte & 0xFF);
 
@@ -139,8 +158,9 @@ test_alloc(void) {
 			}
 
 			size_t alignsize = (iloop * ipass + datasize[(iloop + ipass * 3) % 7]) & 0x2FF;
+			this_alignment = alignment[(ipass + 1) % 5];
 			capsize = (capsize > alignsize ? alignsize : capsize);
-			baseptr = rpaligned_realloc(baseptr, 128, alignsize, resize, 0);
+			baseptr = rpaligned_realloc(baseptr, this_alignment, alignsize, resize, 0);
 			for (size_t ibyte = 0; ibyte < capsize; ++ibyte) {
 				if (baseptr[ibyte] != (char)(ibyte & 0xFF))
 					return test_fail("Data not preserved on realloc");
@@ -284,6 +304,20 @@ test_alloc(void) {
 	}
 	rpmalloc_finalize();
 
+	// Test that a full span with deferred block is finalized properly
+	rpmalloc_initialize();
+	{
+		addr[0] = rpmalloc(23457);
+	
+		thread_arg targ;
+		targ.fn = defer_free_thread;
+		targ.arg = addr[0];
+		uintptr_t thread = thread_run(&targ);
+		thread_sleep(100);
+		thread_join(thread);
+	}
+	rpmalloc_finalize();
+
 	printf("Memory allocation tests passed\n");
 
 	return 0;
@@ -318,6 +352,10 @@ test_realloc(void) {
 	while (bigsize < 3 * 1024 * 1024) {
 		++bigsize;
 		bigptr = rprealloc(bigptr, bigsize);
+		if (rpaligned_realloc(bigptr, 0, bigsize * 32, 0, RPMALLOC_GROW_OR_FAIL))
+			return test_fail("Reallocation with grow-or-fail did not fail as expected");
+		if (rpaligned_realloc(bigptr, 128, bigsize * 32, 0, RPMALLOC_GROW_OR_FAIL))
+			return test_fail("Reallocation with aligned grow-or-fail did not fail as expected");
 	}
 	rpfree(bigptr);
 
@@ -366,6 +404,7 @@ typedef struct _allocator_thread_arg {
 	unsigned int        num_datasize; //max 32
 	void**              pointers;
 	void**              crossthread_pointers;
+	int                 init_fini_each_loop;
 } allocator_thread_arg_t;
 
 static void
@@ -390,7 +429,13 @@ allocator_thread(void* argp) {
 
 	thread_sleep(1);
 
+	if (arg.init_fini_each_loop)
+		rpmalloc_thread_finalize();
+
 	for (iloop = 0; iloop < arg.loops; ++iloop) {
+		if (arg.init_fini_each_loop)
+			rpmalloc_thread_initialize();
+
 		for (ipass = 0; ipass < arg.passes; ++ipass) {
 			cursize = 4 + arg.datasize[(iloop + ipass + iwait) % arg.num_datasize] + ((iloop + ipass) % 1024);
 
@@ -433,12 +478,95 @@ allocator_thread(void* argp) {
 
 			rpfree(addr[ipass]);
 		}
+
+		if (arg.init_fini_each_loop)
+			rpmalloc_thread_finalize();
 	}
+
+	if (arg.init_fini_each_loop)
+		rpmalloc_thread_initialize();
 
 	rpfree(data);
 	rpfree(addr);
 
 	rpmalloc_thread_finalize();
+
+end:
+	thread_exit((uintptr_t)ret);
+}
+
+static void
+heap_allocator_thread(void* argp) {
+	allocator_thread_arg_t arg = *(allocator_thread_arg_t*)argp;
+	unsigned int iloop = 0;
+	unsigned int ipass = 0;
+	unsigned int icheck = 0;
+	unsigned int id = 0;
+	void** addr;
+	uint32_t* data;
+	unsigned int cursize;
+	unsigned int iwait = 0;
+	int ret = 0;
+
+	rpmalloc_heap_t* outer_heap = rpmalloc_heap_acquire();
+
+	addr = rpmalloc_heap_alloc(outer_heap, sizeof(void*) * arg.passes);
+	data = rpmalloc_heap_alloc(outer_heap, 512 * 1024);
+	for (id = 0; id < 512 * 1024 / 4; ++id)
+		data[id] = id;
+
+	thread_sleep(1);
+
+	for (iloop = 0; iloop < arg.loops; ++iloop) {
+		rpmalloc_heap_t* heap = rpmalloc_heap_acquire();
+
+		for (ipass = 0; ipass < arg.passes; ++ipass) {
+			cursize = 4 + arg.datasize[(iloop + ipass + iwait) % arg.num_datasize] + ((iloop + ipass) % 1024);
+
+			addr[ipass] = rpmalloc_heap_alloc(heap, 4 + cursize);
+			if (addr[ipass] == 0) {
+				ret = test_fail("Allocation failed");
+				goto end;
+			}
+
+			*(uint32_t*)addr[ipass] = (uint32_t)cursize;
+			memcpy(pointer_offset(addr[ipass], 4), data, cursize);
+
+			for (icheck = 0; icheck < ipass; ++icheck) {
+				if (addr[icheck] == addr[ipass]) {
+					ret = test_fail("Identical pointer returned from allocation");
+					goto end;
+				}
+				if (addr[icheck] < addr[ipass]) {
+					if (pointer_offset(addr[icheck], *(uint32_t*)addr[icheck] + 4) > addr[ipass]) {
+						ret = test_fail("Invalid pointer inside another block returned from allocation");
+						goto end;
+					}
+				}
+				else if (addr[icheck] > addr[ipass]) {
+					if (pointer_offset(addr[ipass], *(uint32_t*)addr[ipass] + 4) > addr[icheck]) {
+						ret = test_fail("Invalid pointer inside another block returned from allocation");
+						goto end;
+					}
+				}
+			}
+		}
+
+		for (ipass = 0; ipass < arg.passes; ++ipass) {
+			cursize = *(uint32_t*)addr[ipass];
+
+			if (memcmp(pointer_offset(addr[ipass], 4), data, cursize)) {
+				ret = test_fail("Data corrupted");
+				goto end;
+			}
+		}
+
+		rpmalloc_heap_free_all(heap);
+		rpmalloc_heap_release(heap);
+	}
+
+	rpmalloc_heap_free_all(outer_heap);
+	rpmalloc_heap_release(outer_heap);
 
 end:
 	thread_exit((uintptr_t)ret);
@@ -465,7 +593,7 @@ crossallocator_thread(void* argp) {
 	for (iloop = 0; iloop < arg.loops; ++iloop) {
 		for (ipass = 0; ipass < arg.passes; ++ipass) {
 			size_t iarg = (iloop + ipass + iextra++) % arg.num_datasize;
-			cursize = arg.datasize[iarg] + ((iloop + ipass) % 21);
+			cursize = arg.datasize[iarg] + ((iloop + ipass) % 439);
 			void* first_addr = rpmalloc(cursize);
 			if (first_addr == 0) {
 				ret = test_fail("Allocation failed");
@@ -481,7 +609,7 @@ crossallocator_thread(void* argp) {
 			}
 
 			iarg = (iloop + ipass + iextra++) % arg.num_datasize;
-			cursize = arg.datasize[iarg] + ((iloop + ipass) % 17);
+			cursize = arg.datasize[iarg] + ((iloop + ipass) % 751);
 			void* third_addr = rpmalloc(cursize);
 			if (third_addr == 0) {
 				ret = test_fail("Allocation failed");
@@ -650,6 +778,7 @@ test_threaded(void) {
 	arg.num_datasize = 16;
 	arg.loops = 100;
 	arg.passes = 4000;
+	arg.init_fini_each_loop = 0;
 
 	thread_arg targ;
 	targ.fn = allocator_thread;
@@ -676,17 +805,17 @@ test_threaded(void) {
 
 static int 
 test_crossthread(void) {
-	uintptr_t thread[8];
-	allocator_thread_arg_t arg[8];
-	thread_arg targ[8];
+	uintptr_t thread[32];
+	allocator_thread_arg_t arg[32];
+	thread_arg targ[32];
 
 	rpmalloc_initialize();
 
 	size_t num_alloc_threads = _hardware_threads;
 	if (num_alloc_threads < 2)
 		num_alloc_threads = 2;
-	if (num_alloc_threads > 4)
-		num_alloc_threads = 4;
+	if (num_alloc_threads > 16)
+		num_alloc_threads = 16;
 
 	for (unsigned int ithread = 0; ithread < num_alloc_threads; ++ithread) {
 		unsigned int iadd = (ithread * (16 + ithread) + ithread) % 128;
@@ -703,11 +832,11 @@ test_crossthread(void) {
 		arg[ithread].datasize[6] = 3892 + iadd;
 		arg[ithread].datasize[7] = 19 + iadd;
 		arg[ithread].datasize[8] = 154 + iadd;
-		arg[ithread].datasize[9] = 39723 + iadd;
-		arg[ithread].datasize[10] = 15 + iadd;
-		arg[ithread].datasize[11] = 493 + iadd;
+		arg[ithread].datasize[9] = 9723 + iadd;
+		arg[ithread].datasize[10] = 15543 + iadd;
+		arg[ithread].datasize[11] = 32493 + iadd;
 		arg[ithread].datasize[12] = 34 + iadd;
-		arg[ithread].datasize[13] = 894 + iadd;
+		arg[ithread].datasize[13] = 1894 + iadd;
 		arg[ithread].datasize[14] = 193 + iadd;
 		arg[ithread].datasize[15] = 2893 + iadd;
 		arg[ithread].num_datasize = 16;
@@ -805,6 +934,70 @@ test_threadspam(void) {
 	return 0;
 }
 
+static int
+test_first_class_heaps(void) {
+	uintptr_t thread[32];
+	uintptr_t threadres[32];
+	unsigned int i;
+	size_t num_alloc_threads;
+	allocator_thread_arg_t arg[32];
+
+	rpmalloc_initialize();
+
+	num_alloc_threads = _hardware_threads * 2;
+	if (num_alloc_threads < 2)
+		num_alloc_threads = 2;
+	if (num_alloc_threads > 16)
+		num_alloc_threads = 16;
+
+	for (i = 0; i < num_alloc_threads; ++i) {
+		arg[i].datasize[0] = 19;
+		arg[i].datasize[1] = 249;
+		arg[i].datasize[2] = 797;
+		arg[i].datasize[3] = 3058;
+		arg[i].datasize[4] = 47892;
+		arg[i].datasize[5] = 173902;
+		arg[i].datasize[6] = 389;
+		arg[i].datasize[7] = 19;
+		arg[i].datasize[8] = 2493;
+		arg[i].datasize[9] = 7979;
+		arg[i].datasize[10] = 3;
+		arg[i].datasize[11] = 79374;
+		arg[i].datasize[12] = 3432;
+		arg[i].datasize[13] = 548;
+		arg[i].datasize[14] = 38934;
+		arg[i].datasize[15] = 234;
+		arg[i].num_datasize = 16;
+		arg[i].loops = 100;
+		arg[i].passes = 4000;
+		arg[i].init_fini_each_loop = 1;
+
+		thread_arg targ;
+		targ.fn = heap_allocator_thread;
+		if ((i % 2) != 0)
+			targ.fn = allocator_thread;
+		targ.arg = &arg[i];
+
+		thread[i] = thread_run(&targ);
+	}
+
+	thread_sleep(1000);
+
+	for (i = 0; i < num_alloc_threads; ++i)
+		threadres[i] = thread_join(thread[i]);
+
+	rpmalloc_finalize();
+
+	for (i = 0; i < num_alloc_threads; ++i) {
+		if (threadres[i])
+			return -1;
+	}
+
+	printf("Heap threaded tests passed\n");
+
+	return 0;
+}
+
 int
 test_run(int argc, char** argv) {
 	(void)sizeof(argc);
@@ -821,6 +1014,8 @@ test_run(int argc, char** argv) {
 	if (test_threadspam())
 		return -1;
 	if (test_threaded())
+		return -1;
+	if (test_first_class_heaps())
 		return -1;
 	printf("All tests passed\n");
 	return 0;
