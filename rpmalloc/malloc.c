@@ -94,8 +94,8 @@ extern void* _Znamm(uint64_t size, uint64_t align); void* _Znamm(uint64_t size, 
 // 32-bit operators new and new[], normal and aligned
 extern void* _Znwj(uint32_t size); void* _Znwj(uint32_t size) { return rpmalloc(size); }
 extern void* _Znaj(uint32_t size); void* _Znaj(uint32_t size) { return rpmalloc(size); }
-extern void* _Znwjj(uint64_t size, uint64_t align); void* _Znwjj(uint64_t size, uint64_t align) { return rpaligned_alloc(align, size); }
-extern void* _Znajj(uint64_t size, uint64_t align); void* _Znajj(uint64_t size, uint64_t align) { return rpaligned_alloc(align, size); }
+extern void* _Znwjj(uint32_t size, uint32_t align); void* _Znwjj(uint32_t size, uint32_t align) { return rpaligned_alloc(align, size); }
+extern void* _Znajj(uint32_t size, uint32_t align); void* _Znajj(uint32_t size, uint32_t align) { return rpaligned_alloc(align, size); }
 #endif
 
 #endif
@@ -160,7 +160,11 @@ void* memalign(size_t alignment, size_t size) RPALIAS(rpmemalign)
 int posix_memalign(void** memptr, size_t alignment, size_t size) RPALIAS(rpposix_memalign)
 void free(void* ptr) RPALIAS(rpfree)
 void cfree(void* ptr) RPALIAS(rpfree)
+#if defined(__ANDROID__)
+size_t malloc_usable_size(const void* ptr) RPALIAS(rpmalloc_usable_size)
+#else
 size_t malloc_usable_size(void* ptr) RPALIAS(rpmalloc_usable_size)
+#endif
 size_t malloc_size(void* ptr) RPALIAS(rpmalloc_usable_size)
 
 #endif
@@ -229,7 +233,10 @@ pvalloc(size_t size) {
 
 #if defined(BUILD_DYNAMIC_LINK) && BUILD_DYNAMIC_LINK
 
-__declspec(dllexport) BOOL WINAPI
+extern __declspec(dllexport) BOOL WINAPI
+DllMain(HINSTANCE instance, DWORD reason, LPVOID reserved);
+
+extern __declspec(dllexport) BOOL WINAPI
 DllMain(HINSTANCE instance, DWORD reason, LPVOID reserved) {
 	(void)sizeof(reserved);
 	(void)sizeof(instance);
